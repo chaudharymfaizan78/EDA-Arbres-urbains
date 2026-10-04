@@ -1,0 +1,13 @@
+[project]
+name = "EDA-Arbres-urbains"
+
+[dependencies]
+here = "*"
+janitor = "*"
+knitr = "*"
+leaflet = "*"
+naniar = "*"
+rmarkdown = "*"
+scales = "*"
+sf = "*"
+tidyverse = "*"

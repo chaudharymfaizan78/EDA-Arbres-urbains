@@ -1,0 +1,785 @@
+---
+title: "Urban Trees of Saint-Germain-en-Laye"
+subtitle: "An exploratory data analysis of the municipal tree inventory"
+lang: en
+author: "M. Faizan Ch"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    number-sections: true
+    anchor-sections: true
+    smooth-scroll: true
+    # --- Code visibility: readers can switch it on/off with the "Code" menu (top right) ---
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+    fig-width: 8
+    fig-height: 5
+    fig-align: center
+    fig-cap-location: bottom
+    tbl-cap-location: top
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+# Introduction
+
+Trees in a town are public infrastructure: they shade streets, absorb rainwater and shape the character of a neighbourhood, but they also age, get injured, and sometimes become a safety risk. To manage them, municipalities keep an **inventory** that records where each tree is, what it is, how big it is and what condition it is in.
+
+This report explores the **urban tree inventory of Saint-Germain-en-Laye** (Yvelines, France), published as open data on [data.gouv.fr](https://www.data.gouv.fr/datasets/arbres-urbains). Each row is one tree, described by its location, species, dimensions, planting environment, a phytosanitary inspection (collar, trunk and crown) and an overall health diagnosis.
+
+**Objectives**
+
+1.  Understand the structure and quality of the data (types, missing values, duplicates, implausible values).
+2.  Describe each important variable: distributions, dominant categories and outliers.
+3.  Explore relationships between tree size, age, vigour and health.
+4.  Explore where the trees are, and where the unhealthy ones are.
+
+::: callout-tip
+## How to read this report
+
+- **Code is optional.** Use the **Code** menu at the top right of the page to *show* or *hide all code* at once, or click *Show code* under any section to unfold just that block.
+- Every section opens with a short explanation of what is done and why, and every table and figure carries a numbered caption that is followed by a short takeaway.
+:::
+
+::: callout-note
+The dataset comes with a legend (`arbres-urbains_legende.pdf`) that explains the many short codes used in the data (for example `C2` for a diagnosis class or `Gr` for a grate). In @sec-cleaning these codes are translated into readable labels using that legend.
+:::
+
+# Setup {#sec-setup}
+
+This section loads the R packages used in the report and defines the visual style shared by all figures. Nothing here produces output: it only prepares the session.
+
+```{r}
+#| label: setup
+
+library(tidyverse)   # data manipulation and ggplot2
+library(here)        # project-relative file paths
+library(janitor)     # column-name cleaning
+library(naniar)      # missing-value plots
+library(sf)          # spatial data
+library(leaflet)     # interactive maps
+library(scales)      # number / percent formatting
+library(knitr)       # tables
+
+theme_set(theme_minimal(base_size = 12) +
+            theme(plot.title.position = "plot",
+                  panel.grid.minor = element_blank()))
+main_col <- "#2a9d8f"
+
+csv_path <- here("Data", "Raw", "arbres-urbains.csv")
+geo_path <- here("Data", "Raw", "arbres-urbains.geojson")
+```
+
+# Data import
+
+The inventory ships in two equivalent formats: a **CSV** (one row per tree, used for the statistical analysis) and a **GeoJSON** (same trees with a point geometry, used for mapping in @sec-spatial). The CSV is read first.
+
+```{r}
+#| label: import
+
+trees_raw <- read_csv(csv_path, show_col_types = FALSE)
+```
+
+```{r}
+#| label: tbl-overview
+#| tbl-cap: "Overview of the raw dataset."
+
+tibble(
+  Item  = c("Trees (rows)", "Variables (columns)", "Commune(s)", "Diagnostics carried out between"),
+  Value = c(nrow(trees_raw),
+            ncol(trees_raw),
+            paste(unique(trees_raw$commune), collapse = ", "),
+            paste(format(range(trees_raw$date_diagnostic, na.rm = TRUE), "%Y-%m-%d"), collapse = " and "))
+) |>
+  kable()
+```
+
+The dataset describes `r nrow(trees_raw)` trees with `r ncol(trees_raw)` variables (@tbl-overview). With that many columns, it helps to group them by purpose before going further.
+
+```{r}
+#| label: tbl-dictionary
+#| tbl-cap: "The 57 variables grouped by purpose (names as in the source file)."
+
+tribble(
+  ~Group, ~Variables, ~`What they describe`,
+  "Identification and location", "id_arbre, commune, quartier, site, cote_voirie, matricule_arbre, Long, Lat", "Unique ID, neighbourhood, street or site, and GPS coordinates.",
+  "Taxonomy", "genre_arbre, espece_arbre", "Genus (e.g. Tilia) and species / cultivar.",
+  "Planting environment", "situation, type_sol, surf_permeable", "Row, group or isolated tree; ground cover at the foot of the tree; permeable surface around it.",
+  "Age and size", "date_plantation, classe_age, hauteur, classe_hauteur, diametre, circonference (en cm), classe_circonference", "Planting year, height, trunk diameter and circumference, and the corresponding classes.",
+  "Habit and vigour", "port_arbre, vigueur_pousse", "Crown shape (free, pleached...) and growth vigour.",
+  "Inspection: collar, trunk, crown", "champignon_*, insecte_*, plaie_*, fissure_*, bois_mort_houppier, rejet_tronc, ecorce_incluse_houppier, observation_*", "Presence of fungi, insects, wounds, cracks and dead wood on each part of the tree.",
+  "Diagnosis", "esperance_maintien, contrainte, classification_diagnostic, date_diagnostic", "Expected remaining lifespan, constraints, and overall health class (C1 healthy to C5 removal needed).",
+  "Planned work", "prescription_1-3, observation_travaux, type_delai_*, delai_*", "Pruning or removal prescribed and when it is scheduled.",
+  "Other", "controle, reference_photo", "Control flag and photo reference."
+) |>
+  kable()
+```
+
+# Data preparation {#sec-cleaning}
+
+Raw open data is rarely analysis-ready. This section makes the following changes, each of which is explained in the code comments:
+
+- **Standardise names and text.** Column names become `snake_case`, extra spaces are trimmed, and empty strings become proper missing values (`NA`).
+- **Decode the legend.** Short codes are replaced by readable labels. Where the legend defines an order (e.g. age classes, health classes), the variable is stored as an *ordered* factor so plots and tables keep that order.
+- **Convert units.** Height is stored in centimetres in the source (a `hauteur` of 1000 is classed `H2`, "5 to 10 m"), so it is converted to metres.
+- **Repair species names.** The species field contains cultivar and author fragments (e.g. `Europaea - - Pallida`), so only the species epithet is kept and combined with the genus.
+- **Flag implausible values.** An impossible planting year is set to `NA` rather than silently kept.
+
+```{r}
+#| label: cleaning
+
+# Step 1 - tidy names and text (kept as `trees_clean` so data-quality checks use the source values)
+trees_clean <- trees_raw |>
+  clean_names() |>
+  mutate(across(where(is.character), ~ na_if(str_squish(.x), "")))
+
+# Helper: replace legend codes with labels; undocumented codes are kept as they are
+decode <- function(x, map, ordered = FALSE) {
+  x   <- as.character(x)
+  lab <- unname(map[x])
+  lab <- if_else(is.na(lab) & !is.na(x), x, lab)
+  lev <- c(unname(map), setdiff(unique(lab), c(unname(map), NA)))
+  droplevels(factor(lab, levels = lev, ordered = ordered))
+}
+
+# Step 2 - labels taken from the dataset legend (PDF)
+lab_soil <- c(P = "Mulch", G = "Grass", S = "Stabilised", Gr = "Grate", GR = "Gravel",
+              MA = "Planting bed", E = "Asphalt", CS = "Ground cover")
+lab_age  <- c(J = "Young (<10 y)", JA = "Young adult (10-20 y)", A = "Adult (20-40 y)",
+              AM = "Mature adult (50-70 y)")
+lab_hgt  <- c(H1 = "0-5 m", H2 = "5-10 m", H3 = "10-15 m", H4 = "15-20 m", H5 = "20-25 m")
+lab_circ <- c(C1 = "0-0.5 m", C2 = "0.5-1 m", C3 = "1-1.5 m", C4 = "1.5-2 m", C5 = "2-2.5 m",
+              C6 = "2.5-3 m", C7 = "3-3.5 m")
+lab_hab  <- c(L = "Free", SL = "Semi-free", R5 = "Screen (5 faces)", RR = "Reduced-relaxed",
+              A = "Architectural")
+lab_vig  <- c(D = "Declining", PP = "Low growth", MP = "Medium growth", P = "Growing")
+lab_life <- c(`4` = "< 5 years", `3` = "5-10 years", `2` = "10-15 years", `1` = "> 15 years")
+lab_diag <- c(C1 = "C1 Healthy", C2 = "C2 Minor lesions", C3 = "C3 Major lesions",
+              C4 = "C4 Major, worsening", C5 = "C5 Removal needed")
+lab_sit  <- c(Alignement = "Street row", Isolé = "Isolated", Groupe = "Group", Bosquet = "Grove")
+
+trees <- trees_clean |>
+  mutate(
+    # categorical variables
+    soil          = decode(type_sol, lab_soil),
+    age_class     = decode(classe_age, lab_age, ordered = TRUE),
+    height_class  = decode(classe_hauteur, lab_hgt, ordered = TRUE),
+    circ_class    = decode(classe_circonference, lab_circ, ordered = TRUE),
+    habit         = decode(port_arbre, lab_hab),
+    vigour        = decode(vigueur_pousse, lab_vig, ordered = TRUE),
+    life_expect   = decode(esperance_maintien, lab_life, ordered = TRUE),
+    diagnostic    = decode(classification_diagnostic, lab_diag, ordered = TRUE),
+    situation_lbl = decode(situation, lab_sit),
+    district      = str_replace(quartier, "^Quartier (\\d+) - ", "Q\\1 - "),
+    # taxonomy: genus + species epithet only
+    genus         = genre_arbre,
+    species       = if_else(is.na(genre_arbre) | is.na(espece_arbre), NA_character_,
+                            paste(genre_arbre, str_to_lower(word(espece_arbre, 1)))),
+    # numeric variables
+    height_m          = hauteur / 100,
+    circumference_cm  = circonference_en_cm,
+    plantation_year   = if_else(date_plantation >= 1800, date_plantation, NA_real_),
+    permeable_surface = surf_permeable
+  )
+
+num_labels <- c(height_m = "Height (m)",
+                circumference_cm = "Circumference (cm)",
+                plantation_year = "Planting year",
+                permeable_surface = "Permeable surface")
+num_vars <- names(num_labels)
+
+diag_cols <- setNames(c("#2a9d8f", "#8ab17d", "#e9c46a", "#f4a261", "#e76f51"),
+                      levels(trees$diagnostic))
+```
+
+The cleaned table `trees` keeps every original variable and adds the readable ones. From here on, the analysis focuses on **four numeric variables** (height, circumference, planting year and permeable surface) and a set of **categorical variables** (age class, habit, vigour, soil, situation, diagnosis...).
+
+# Data quality {#sec-quality}
+
+Before describing the trees, we need to know how far the data can be trusted. This section checks three things: **duplicates**, **missing values** and **implausible values**.
+
+## Duplicates
+
+```{r}
+#| label: tbl-duplicates
+#| tbl-cap: "Duplicate checks."
+
+tibble(
+  Check = c("Fully duplicated rows", "Duplicated tree identifiers (id_arbre)"),
+  Count = c(sum(duplicated(trees_clean)), sum(duplicated(trees_clean$id_arbre)))
+) |>
+  kable()
+```
+
+There are no duplicated rows and no repeated identifiers (@tbl-duplicates): each row is a distinct tree.
+
+## Missing values
+
+Missing values are counted per variable. Note that the value `"Non"` ("no") used in the inspection columns is a real answer, not a missing value.
+
+```{r}
+#| label: tbl-missing
+#| tbl-cap: "The 15 variables with the most missing values."
+
+miss_tbl <- miss_var_summary(trees_clean) |>
+  filter(n_miss > 0) |>
+  transmute(Variable = variable, `Missing (n)` = n_miss, `Missing (%)` = round(pct_miss, 1))
+
+miss_tbl |> slice_head(n = 15) |> kable()
+```
+
+```{r}
+#| label: fig-missing
+#| fig-height: 7
+#| fig-cap: "Share of missing values for every variable that has at least one gap."
+
+trees_clean |>
+  select(all_of(miss_tbl$Variable)) |>
+  gg_miss_var(show_pct = TRUE) +
+  labs(y = "Missing (%)", x = NULL)
+```
+
+`r nrow(miss_tbl)` of the `r ncol(trees_clean)` variables have gaps (@fig-missing). The most incomplete ones are free-text observations and the planned-work columns (@tbl-missing). This is expected rather than worrying: a comment or a prescription only exists when there is something to say or do. The core variables used in this report (species, dimensions, diagnosis) are almost complete.
+
+```{r}
+#| label: fig-miss-pattern
+#| fig-height: 6
+#| fig-cap: "Missingness pattern: each row is a tree and each column a variable (dark = missing)."
+
+trees_clean |>
+  select(all_of(miss_tbl$Variable)) |>
+  vis_miss(warn_large_data = FALSE) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 7))
+```
+
+@fig-miss-pattern shows that gaps often occur *together*: prescription and scheduling columns are empty for the same trees, because they belong to the same "planned work" record.
+
+## Implausible values
+
+```{r}
+#| label: tbl-checks
+#| tbl-cap: "Consistency checks on the source values and how each one is handled."
+
+diam_ratio <- trees_clean$diametre / (trees_clean$circonference_en_cm / pi)
+
+tibble(
+  Check = c("Planting year before 1800",
+            "Trunk diameter vs. circumference / pi (ratio min - max)",
+            "Trees without a health diagnosis",
+            "Trees without an expected-lifespan class"),
+  Result = c(sum(trees_clean$date_plantation < 1800, na.rm = TRUE),
+             paste(round(range(diam_ratio, na.rm = TRUE), 2), collapse = " - "),
+             sum(is.na(trees_clean$classification_diagnostic)),
+             sum(is.na(trees_clean$esperance_maintien))),
+  Handling = c("Set to missing (impossible for a planted urban tree).",
+               "Diameter is exactly twice circumference / pi in every row, so it is not a true diameter. Circumference is used instead.",
+               "Kept in the data; shown as 'not assessed' on maps.",
+               "Kept; excluded from the lifespan chart.")
+) |>
+  kable()
+```
+
+Two problems appear in @tbl-checks. First, a single tree has a planting year of `r min(trees_clean$date_plantation)`, which is not possible, so it is excluded from anything involving planting year. Second, the `diametre` column is **exactly 2 x circumference / pi** for every tree, so it seems to contain a systematic calculation error in the source data. Because it is a perfect duplicate of circumference (up to a constant), it adds no information and **circumference is used as the size measure** throughout.
+
+# Univariate analysis
+
+Here each variable is described on its own, first the numeric ones and then the categorical ones.
+
+## Numeric variables
+
+```{r}
+#| label: num-long
+
+num_long <- trees |>
+  select(all_of(num_vars)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  mutate(variable = factor(variable, levels = num_vars, labels = num_labels))
+```
+
+```{r}
+#| label: tbl-num-summary
+#| tbl-cap: "Summary statistics of the numeric variables."
+
+num_long |>
+  group_by(Variable = variable) |>
+  summarise(
+    n         = sum(!is.na(value)),
+    Missing   = sum(is.na(value)),
+    Min       = min(value, na.rm = TRUE),
+    Q1        = quantile(value, .25, na.rm = TRUE),
+    Median    = median(value, na.rm = TRUE),
+    Mean      = mean(value, na.rm = TRUE),
+    Q3        = quantile(value, .75, na.rm = TRUE),
+    Max       = max(value, na.rm = TRUE),
+    SD        = sd(value, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  kable(digits = 1)
+```
+
+@tbl-num-summary gives the typical tree: a median height of `r median(trees$height_m)` m, a median circumference of `r median(trees$circumference_cm)` cm, planted around `r median(trees$plantation_year, na.rm = TRUE)`. For a distribution, a histogram is more telling than a summary line.
+
+```{r}
+#| label: fig-num-hist
+#| fig-height: 6
+#| fig-cap: "Distribution of the four numeric variables."
+
+num_long |>
+  drop_na(value) |>
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30, fill = main_col, colour = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(x = NULL, y = "Number of trees")
+```
+
+Height, circumference and permeable surface are all **right-skewed** (@fig-num-hist): most trees are small or medium-sized and a few are very large. Planting years pile up on a few rounded values (1980, 2000, 2010) rather than spreading smoothly over time.
+
+```{r}
+#| label: fig-num-box
+#| fig-height: 5
+#| fig-cap: "Boxplots of the numeric variables; points beyond the whiskers are outliers under the IQR rule."
+
+num_long |>
+  drop_na(value) |>
+  ggplot(aes(x = "", y = value)) +
+  geom_boxplot(fill = main_col, alpha = .6, outlier.alpha = .4) +
+  facet_wrap(~ variable, scales = "free") +
+  labs(x = NULL, y = NULL)
+```
+
+### Outliers
+
+Outliers are flagged with the standard **IQR rule**: a value is an outlier if it lies more than 1.5 x IQR below the first quartile or above the third quartile.
+
+```{r}
+#| label: tbl-outliers
+#| tbl-cap: "Outliers under the 1.5 x IQR rule."
+
+num_long |>
+  drop_na(value) |>
+  group_by(Variable = variable) |>
+  summarise(
+    `Lower bound` = quantile(value, .25) - 1.5 * IQR(value),
+    `Upper bound` = quantile(value, .75) + 1.5 * IQR(value),
+    Outliers      = sum(value < `Lower bound` | value > `Upper bound`),
+    `Share (%)`   = round(100 * Outliers / n(), 1),
+    .groups = "drop"
+  ) |>
+  arrange(desc(Outliers)) |>
+  kable(digits = 1)
+```
+
+The outliers in @tbl-outliers are mostly **genuine**: old, large trees and wide planting beds exist in any town. They are therefore kept rather than removed. The one truly erroneous value (planting year 200) was already handled in @sec-quality.
+
+## Categorical variables
+
+Categorical variables describe the tree itself (age class, size class, crown habit), its surroundings (soil, situation) and its condition (vigour, diagnosis). Bars are shown with counts and percentages, in the natural order of the legend when there is one.
+
+```{r}
+#| label: cat-fn
+
+var_labels <- c(age_class = "Age class", height_class = "Height class",
+                circ_class = "Circumference class", habit = "Crown habit",
+                soil = "Soil at tree foot", situation_lbl = "Situation",
+                diagnostic = "Diagnosis", vigour = "Growth vigour",
+                life_expect = "Expected remaining lifespan")
+
+# Several categorical variables as small-multiple bar charts
+facet_bars <- function(df, vars, ncol = 2) {
+  counts <- map_dfr(vars, \(v) {
+    d <- df |> filter(!is.na(.data[[v]])) |> count(level = .data[[v]])
+    if (!is.ordered(df[[v]])) d <- arrange(d, desc(n))
+    d |> mutate(variable = v, level = as.character(level),
+                pct = n / sum(n), label = paste0(n, " (", percent(pct, accuracy = 1), ")"))
+  }) |>
+    mutate(key = paste(variable, level, sep = "___"))
+
+  counts |>
+    mutate(key = factor(key, levels = rev(unique(key))),
+           variable = factor(variable, levels = vars, labels = var_labels[vars])) |>
+    ggplot(aes(n, key)) +
+    geom_col(fill = main_col) +
+    geom_text(aes(label = label), hjust = -0.05, size = 3) +
+    scale_x_continuous(expand = expansion(mult = c(0, .35))) +
+    scale_y_discrete(labels = \(x) str_remove(x, "^.*___")) +
+    facet_wrap(~ variable, scales = "free", ncol = ncol) +
+    labs(x = "Number of trees", y = NULL)
+}
+
+# One variable, top-n levels
+plot_cat <- function(df, var, n = 15, xlab = "Number of trees") {
+  df |>
+    filter(!is.na(.data[[var]])) |>
+    count(level = as.character(.data[[var]]), sort = TRUE) |>
+    slice_head(n = n) |>
+    mutate(label = paste0(n, " (", percent(n / sum(!is.na(df[[var]])), accuracy = 1), ")")) |>
+    ggplot(aes(n, fct_reorder(str_wrap(level, 30), n))) +
+    geom_col(fill = main_col) +
+    geom_text(aes(label = label), hjust = -0.05, size = 3) +
+    scale_x_continuous(expand = expansion(mult = c(0, .2))) +
+    labs(x = xlab, y = NULL)
+}
+```
+
+### Structure of the tree population
+
+```{r}
+#| label: fig-cat-structure
+#| fig-height: 9
+#| fig-cap: "Age, size, habit, soil and situation of the trees (count and share of trees with a known value)."
+
+facet_bars(trees, c("age_class", "height_class", "circ_class", "habit", "soil", "situation_lbl"))
+```
+
+The population is dominated by **adult and young-adult trees on street rows**, mostly under 10 m tall (@fig-cat-structure). Very old trees (mature adults) and isolated or grove trees are rare, so conclusions about them rest on very few observations.
+
+### Health and vigour
+
+```{r}
+#| label: fig-cat-health
+#| fig-height: 5
+#| fig-cap: "Health diagnosis, growth vigour and expected remaining lifespan."
+
+facet_bars(trees, c("diagnostic", "vigour", "life_expect"), ncol = 3) +
+  theme(axis.text.y = element_text(size = 8))
+```
+
+Most trees are in **good condition** (@fig-cat-health): they are classed C1 or C2, grow vigorously and are expected to live more than 15 more years. Trees needing removal (C5) and declining trees are a small minority, but they matter most to the municipality.
+
+### Neighbourhoods
+
+```{r}
+#| label: fig-district
+#| fig-height: 4
+#| fig-cap: "Number of inventoried trees per neighbourhood."
+
+plot_cat(trees, "district")
+```
+
+## Species and genus
+
+A single genus can dominate a town's canopy, which makes it vulnerable to one pest or disease. The next two figures show how concentrated the inventory is.
+
+```{r}
+#| label: fig-genus
+#| fig-height: 4.5
+#| fig-cap: "The 10 most frequent tree genera."
+
+plot_cat(trees, "genus", n = 10)
+```
+
+```{r}
+#| label: fig-species
+#| fig-height: 6
+#| fig-cap: "The 15 most frequent species (genus + species epithet; cultivars are merged)."
+
+plot_cat(trees, "species", n = 15)
+```
+
+The canopy is **highly concentrated** (@fig-genus and @fig-species): the most frequent genus alone represents `r percent(mean(trees$genus == names(sort(table(trees$genus), decreasing = TRUE))[1], na.rm = TRUE), accuracy = 1)` of the trees, and the `r n_distinct(trees$genus, na.rm = TRUE)` genera in total are unevenly represented.
+
+## Planting dates
+
+```{r}
+#| label: fig-planting
+#| fig-height: 4
+#| fig-cap: "Number of trees by planting year (5-year bins)."
+
+trees |>
+  filter(!is.na(plantation_year)) |>
+  ggplot(aes(plantation_year)) +
+  geom_histogram(binwidth = 5, boundary = 0, fill = main_col, colour = "white") +
+  labs(x = "Planting year", y = "Number of trees")
+```
+
+@fig-planting shows the age structure of the town's trees. Planting years are usually rounded to a decade in the source (1980, 1990, 2000...), so the spikes are partly an artefact of estimation and should not be read as precise planting campaigns. The health diagnoses themselves were all made in 2020.
+
+# Bivariate analysis
+
+Having described the variables one at a time, we now ask how they relate to each other: does bigger mean older, and does age or size go with poorer health?
+
+## Correlations between numeric variables
+
+Because the distributions are skewed, **Spearman rank correlation** is used: it measures whether two variables increase together without assuming a straight-line relationship.
+
+```{r}
+#| label: fig-correlation
+#| fig-height: 5
+#| fig-cap: "Spearman rank correlations between the numeric variables."
+
+cor_mat <- trees |>
+  select(all_of(num_vars)) |>
+  cor(use = "pairwise.complete.obs", method = "spearman")
+dimnames(cor_mat) <- list(num_labels, num_labels)
+
+cor_mat |>
+  as.data.frame() |>
+  rownames_to_column("var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "r") |>
+  mutate(var1 = factor(var1, levels = num_labels), var2 = factor(var2, levels = rev(num_labels))) |>
+  ggplot(aes(var1, var2, fill = r)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = round(r, 2)), size = 3.5) +
+  scale_fill_gradient2(low = "#b2182b", mid = "white", high = "#2166ac", limits = c(-1, 1)) +
+  coord_fixed() +
+  labs(x = NULL, y = NULL, fill = "Spearman r") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+Height and circumference are strongly and positively linked (@fig-correlation), as expected for a growing tree, and both are negatively linked to planting year: **older trees are taller and thicker**. Circumference is very strongly tied to planting year, height only moderately. Permeable surface has a weaker link with size (around 0.3).
+
+```{r}
+#| label: fig-scatter
+#| fig-height: 5
+#| fig-cap: "Height against circumference, coloured by age class, with a smoothed trend (loess). Points are slightly jittered because heights and circumferences are recorded in rounded steps."
+
+ggplot(trees, aes(circumference_cm, height_m)) +
+  geom_jitter(aes(colour = age_class), width = 1.5, height = .15, alpha = .5, size = 1.4) +
+  geom_smooth(method = "loess", se = FALSE, colour = "black", linewidth = .7, formula = y ~ x) +
+  scale_colour_viridis_d(end = .9, na.value = "grey70") +
+  labs(x = "Circumference (cm)", y = "Height (m)", colour = "Age class")
+```
+
+## Size by category
+
+```{r}
+#| label: fig-box-age
+#| fig-height: 4
+#| fig-cap: "Circumference by age class."
+
+trees |>
+  filter(!is.na(age_class)) |>
+  ggplot(aes(age_class, circumference_cm)) +
+  geom_boxplot(fill = main_col, alpha = .6, outlier.alpha = .3) +
+  labs(x = NULL, y = "Circumference (cm)")
+```
+
+The age classes in the data line up with the measurements (@fig-box-age): circumference rises steadily from "young" to "mature adult". This reassures us that the age classes are consistent with the measured dimensions.
+
+```{r}
+#| label: fig-box-genus
+#| fig-height: 4.5
+#| fig-cap: "Height of the six most frequent genera (sorted by median)."
+
+top_genera <- trees |> count(genus, sort = TRUE) |> slice_head(n = 6) |> pull(genus)
+
+trees |>
+  filter(genus %in% top_genera) |>
+  mutate(genus = fct_reorder(genus, height_m, .fun = median)) |>
+  ggplot(aes(genus, height_m)) +
+  geom_boxplot(fill = main_col, alpha = .6, outlier.alpha = .3) +
+  coord_flip() +
+  labs(x = NULL, y = "Height (m)")
+```
+
+Typical heights are similar across the main genera, with medians of roughly 5 to 7 m (@fig-box-genus). Genus therefore explains little of the variation in height on its own; individual tree age and growing conditions matter more.
+
+## Health, age and vigour
+
+Do older trees tend to be in worse condition, and does the diagnosis match the observed growth vigour? Each column of the heatmaps is scaled to 100 %, so cells compare **shares within a group**, and the printed number is the tree count.
+
+```{r}
+#| label: heat-fn
+
+plot_heat <- function(df, x, y, xlab, ylab) {
+  df |>
+    drop_na(all_of(c(x, y))) |>
+    count(xv = .data[[x]], yv = .data[[y]]) |>
+    group_by(xv) |>
+    mutate(share = n / sum(n)) |>
+    ungroup() |>
+    ggplot(aes(xv, yv, fill = share)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = n, colour = share > .55), size = 3.2, show.legend = FALSE) +
+    scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black")) +
+    scale_fill_gradient(low = "#f2f9f8", high = "#1b6f66", labels = percent) +
+    scale_y_discrete(limits = rev) +
+    labs(x = xlab, y = ylab, fill = "Share\nwithin column") +
+    theme(axis.text.x = element_text(angle = 25, hjust = 1))
+}
+```
+
+```{r}
+#| label: fig-heat-age
+#| fig-height: 4.5
+#| fig-cap: "Health diagnosis by age class (label = number of trees; colour = share within each age class)."
+
+plot_heat(trees, "age_class", "diagnostic", "Age class", "Diagnosis")
+```
+
+```{r}
+#| label: fig-heat-vigour
+#| fig-height: 4.5
+#| fig-cap: "Health diagnosis by growth vigour (label = number of trees; colour = share within each vigour class)."
+
+plot_heat(trees, "vigour", "diagnostic", "Growth vigour", "Diagnosis")
+```
+
+Two patterns stand out. **Older trees are more often diagnosed with lesions** than young ones: the share of healthy (C1) trees falls steadily from young to adult trees (@fig-heat-age). The few **declining trees** are mostly in the worst classes (@fig-heat-vigour), but the link is not a clean gradient: trees with *low growth* are often classed C1, possibly because many are young trees that have not yet reached full vigour. Several cells contain only a handful of trees, so percentages there should be read with caution.
+
+# Spatial analysis {#sec-spatial}
+
+The last part places the trees on a map. The GeoJSON file holds the same inventory with a point geometry; it is joined to the cleaned table so the maps can use the readable labels.
+
+```{r}
+#| label: geo-import
+
+trees_sf <- st_read(geo_path, quiet = TRUE) |>
+  clean_names() |>
+  select(id_arbre) |>
+  left_join(select(trees, id_arbre, district, genus, species, height_m, diagnostic),
+            by = "id_arbre")
+
+# Leaflet needs WGS84 (EPSG:4326)
+if (is.na(st_crs(trees_sf))) st_crs(trees_sf) <- 4326 else trees_sf <- st_transform(trees_sf, 4326)
+```
+
+```{r}
+#| label: tbl-geo-check
+#| tbl-cap: "Checks on the spatial file."
+
+tibble(
+  Check = c("Features", "Geometry type", "Empty geometries", "Same number of trees as the CSV",
+            "Trees sharing identical coordinates with another tree"),
+  Result = c(nrow(trees_sf),
+             paste(unique(as.character(st_geometry_type(trees_sf))), collapse = ", "),
+             sum(st_is_empty(trees_sf)),
+             nrow(trees_sf) == nrow(trees),
+             sum(duplicated(st_coordinates(trees_sf))))
+) |>
+  kable()
+```
+
+The spatial file agrees with the CSV (@tbl-geo-check). Coordinates are rounded to three decimals (about 80-110 m), so several trees can share the exact same point; this affects how dense the maps look and is a limit on how precisely a tree can be located.
+
+## Trees per neighbourhood
+
+```{r}
+#| label: tbl-district
+#| tbl-cap: "Trees per neighbourhood and share diagnosed as C3 or worse."
+
+trees |>
+  group_by(Neighbourhood = district) |>
+  summarise(Trees = n(),
+            `C3 or worse (%)` = round(100 * mean(as.integer(diagnostic) >= 3, na.rm = TRUE), 1),
+            .groups = "drop") |>
+  arrange(desc(Trees)) |>
+  kable()
+```
+
+The share of poorly diagnosed trees is around 2-10 % in most neighbourhoods (@tbl-district). Q7 stands out at 75 %, but it holds only 12 trees, so this is a small-sample effect and not evidence of a district-wide problem.
+
+## Static map
+
+```{r}
+#| label: fig-map-static
+#| fig-height: 7
+#| fig-cap: "Location of every tree, coloured by health diagnosis. Grey points were not assessed."
+
+ggplot(trees_sf) +
+  geom_sf(aes(colour = diagnostic), size = 1, alpha = .8) +
+  scale_colour_manual(values = diag_cols, na.value = "grey70") +
+  labs(colour = "Diagnosis")
+```
+
+The trees follow the street network (@fig-map-static), which is what we expect from an inventory dominated by street rows. Trees with poorer diagnoses (orange and red) are visible across several neighbourhoods; @tbl-district puts numbers on the differences.
+
+## Interactive map
+
+The map below can be zoomed and panned. Click a tree to see its species, neighbourhood, height and diagnosis.
+
+::: {#fig-map-leaflet}
+```{r}
+#| label: geo-leaflet
+
+pal <- colorFactor(unname(diag_cols), levels = names(diag_cols), na.color = "#999999")
+
+leaflet(trees_sf) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addCircleMarkers(
+    radius = 4, stroke = FALSE, fillOpacity = .8, color = ~ pal(diagnostic),
+    popup = ~ paste0("<b>", species, "</b><br>", district,
+                     "<br>Height: ", height_m, " m<br>Diagnosis: ", diagnostic)
+  ) |>
+  addLegend("bottomright", pal = pal, values = ~ diagnostic, title = "Diagnosis")
+```
+
+Interactive map of the inventory, coloured by health diagnosis.
+:::
+
+## Where are the trees concentrated?
+
+```{r}
+#| label: fig-density
+#| fig-height: 7
+#| fig-cap: "Two-dimensional density of tree locations (darker = more trees per area)."
+
+st_coordinates(trees_sf) |>
+  as_tibble() |>
+  ggplot(aes(X, Y)) +
+  stat_density_2d_filled(alpha = .85, bins = 8) +
+  geom_point(size = .3, alpha = .35) +
+  scale_fill_viridis_d(option = "mako", direction = -1) +
+  coord_quickmap() +
+  labs(x = "Longitude", y = "Latitude", fill = "Density level")
+```
+
+The density surface highlights the areas with the most trees (@fig-density). Compare it with @tbl-district, where the larger neighbourhoods hold most of the inventory.
+
+# Key findings
+
+```{r}
+#| label: findings-stats
+#| include: false
+
+n_trees      <- nrow(trees)
+top_genus    <- trees |> count(genus, sort = TRUE) |> slice_head(n = 1)
+top3_share   <- trees |> count(genus, sort = TRUE) |> slice_head(n = 3) |> summarise(s = sum(n) / n_trees) |> pull(s)
+share_street <- mean(trees$situation_lbl == "Street row", na.rm = TRUE)
+share_c12    <- mean(as.integer(trees$diagnostic) <= 2, na.rm = TRUE)
+n_c5         <- sum(trees$diagnostic == levels(trees$diagnostic)[5], na.rm = TRUE)
+share_life15 <- mean(trees$life_expect == "> 15 years", na.rm = TRUE)
+n_declining  <- sum(trees$vigour == "Declining", na.rm = TRUE)
+top_district <- trees |> count(district, sort = TRUE) |> slice_head(n = 1)
+```
+
+- **Data quality:** the inventory is clean and complete where it matters. There are no duplicates. Missing values are concentrated in optional comments and planned-work columns. Two issues were found and handled: an impossible planting year (200) and a `diametre` column that is exactly twice circumference / pi in every row.
+- **Dominant species / genera:** the canopy is concentrated. *`r top_genus$genus`* alone makes up `r percent(top_genus$n / n_trees, accuracy = 1)` of the `r n_trees` trees, and the three most frequent genera together make up `r percent(top3_share, accuracy = 1)`.
+- **Size and age structure:** the population is mostly adult and young-adult trees, planted mostly since 1980. Height and circumference are strongly correlated, older trees are larger, and the age classes agree with the measurements.
+- **Health status:** `r percent(share_c12, accuracy = 1)` of the assessed trees are healthy or have only minor lesions (C1-C2), and `r percent(share_life15, accuracy = 1)` are expected to live more than 15 more years. `r n_c5` trees are classed C5 (removal needed) and `r n_declining` are declining. Lesions become more frequent with age, although very old trees are too few to draw firm conclusions.
+- **Spatial pattern:** `r percent(share_street, accuracy = 1)` of the trees stand in street rows, so the map follows the road network. The neighbourhood with the most trees is *`r top_district$district`* (`r top_district$n` trees).
+
+# Limitations and next steps
+
+**Limitations**
+
+- The inventory is a **snapshot**: all diagnoses were made in 2020, so it says nothing about how condition changes over time.
+- Several classes have **very few trees** (mature adults, isolated trees, C4-C5), so comparisons involving them are fragile.
+- Planting years are **rounded** (estimated) and the legend leaves a gap between the "adult" (20-40 y) and "mature adult" (50-70 y) classes.
+- The `diametre` column is unreliable and the unit of `surf_permeable` is not documented in the legend.
+- A few codes appear in the data but are **not in the legend** (for example soil type `TV`); they are kept as-is.
+- Coordinates are rounded to three decimals, which limits the spatial precision.
+
+**Possible next steps**
+
+- Group rare categories into "Other" before any modelling.
+- Predict the health diagnosis or expected lifespan from age, size, genus and planting environment, keeping in mind the class imbalance.
+- Link tree density and health to streets or land use, and compare with a later inventory to measure change.
+
+# Reproducibility
+
+```{r}
+#| label: session
+
+sessionInfo()
+```
